@@ -142,8 +142,11 @@ class DBAScraperGUI:
             
             output_path = output
             if not os.path.isabs(output_path):
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                output_path = os.path.join(script_dir, output_path)
+                if getattr(sys, 'frozen', False):
+                    application_path = os.path.dirname(sys.executable)
+                else:
+                    application_path = os.path.dirname(os.path.abspath(__file__))
+                output_path = os.path.join(application_path, output_path)
 
             try:
                 scrape_all.write_markdown(filtered_results, output_path, title, pages)

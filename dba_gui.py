@@ -1,9 +1,19 @@
+"""
+DISCLAIMER:
+Dette program er udelukkende udviklet til uddannelsesmæssige (educational) formål 
+og som et personligt projekt. Det er op til brugeren af programmet at overholde gældende 
+lovgivning samt handelsbetingelser (Terms of Service) for de hjemmesider, der interageres med. 
+Forfatteren tager intet ansvar for misbrug eller blokeringer forårsaget af dette værktøj.
+"""
+
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import subprocess
 import threading
 import sys
 import os
+
+import scrape_all
 
 class DBAScraperGUI:
     def __init__(self, root):
@@ -71,54 +81,80 @@ class DBAScraperGUI:
         thread.start()
 
     def run_script(self, query, url, pages, output):
-        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scrape_all.py")
-        cmd = [sys.executable, script_path]
-        
-        if url:
-            cmd.extend(["--url", url])
-        elif query:
-            cmd.extend(["--query", query])
-            
-        cmd.extend(["--pages", str(pages)])
-        
-        if output:
-            cmd.extend(["--output", output])
+        def gui_logger(msg):
+            self.root.after(0, self.log, msg)
 
-        self.log(f"Kører: {' '.join(cmd)}")
-        
         try:
-            env = os.environ.copy()
-            env["PYTHONIOENCODING"] = "utf-8"
+            results = scrape_all.get_all_ads(query, url, pages, log_func=gui_logger)
+            if not results:
+                self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
+                return
+
+            categories = list(set(r['category_path'] for r in results))
+            categories.sort()
+
+            # Trigger the filter popup on the main thread
+            self.root.after(0, self.show_category_filter, results, categories, output, query, url, pages)
             
-            # Popen to read output line by line
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            process = subprocess.Popen(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                bufsize=1,
-                cwd=script_dir,
-                env=env
-            )
-            
-            for line in process.stdout:
-                self.root.after(0, self.log, line.strip())
-                
-            process.wait()
-            
-            if process.returncode == 0:
-                self.root.after(0, self.log, "\n--- SUCCES: Scraping er færdig! ---")
-            else:
-                self.root.after(0, self.log, f"\n--- FEJL: Processen afsluttede med kode {process.returncode} ---")
-                
         except Exception as e:
-            self.root.after(0, self.log, f"\n--- EXCEPTION: {str(e)} ---")
-            
-        finally:
+            gui_logger(f"\n--- EXCEPTION: {str(e)} ---")
             self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
+
+    def show_category_filter(self, results, categories, output, query, url, pages):
+        popup = tk.Toplevel(self.root)
+        popup.title("Vælg Kategorier")
+        popup.geometry("500x400")
+        popup.transient(self.root)
+        popup.grab_set()
+
+        ttk.Label(popup, text="Vælg hvilke kategorier du vil inkludere i oversigten:").pack(pady=10, padx=10, anchor=tk.W)
+
+        frame = ttk.Frame(popup)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10)
+
+        # Scrolled frame logic for categories (using Canvas)
+        canvas = tk.Canvas(frame)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        checkbox_vars = {}
+        for cat in categories:
+            var = tk.BooleanVar(value=True)
+            checkbox_vars[cat] = var
+            cb = ttk.Checkbutton(scrollable_frame, text=cat, variable=var)
+            cb.pack(anchor=tk.W, pady=2)
+
+        def on_ok():
+            selected_cats = {cat for cat, var in checkbox_vars.items() if var.get()}
+            filtered_results = [r for r in results if r['category_path'] in selected_cats]
+            
+            title = url if url else query.title()
+            
+            output_path = output
+            if not os.path.isabs(output_path):
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                output_path = os.path.join(script_dir, output_path)
+
+            try:
+                scrape_all.write_markdown(filtered_results, output_path, title, pages)
+                self.log(f"\n--- SUCCES: Scraping færdig. Gemt {len(filtered_results)} annoncer i {output} ---")
+            except Exception as e:
+                self.log(f"\n--- FEJL under gem: {str(e)} ---")
+                
+            self.start_btn.config(state=tk.NORMAL)
+            popup.destroy()
+
+        ttk.Button(popup, text="OK", command=on_ok).pack(pady=10)
 
 if __name__ == "__main__":
     root = tk.Tk()

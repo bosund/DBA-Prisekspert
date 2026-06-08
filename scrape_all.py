@@ -1,3 +1,11 @@
+"""
+DISCLAIMER:
+Dette program er udelukkende udviklet til uddannelsesmæssige (educational) formål 
+og som et personligt projekt. Det er op til brugeren af programmet at overholde gældende 
+lovgivning samt handelsbetingelser (Terms of Service) for de hjemmesider, der interageres med. 
+Forfatteren tager intet ansvar for misbrug eller blokeringer forårsaget af dette værktøj.
+"""
+
 import requests
 import json
 import re
@@ -163,6 +171,52 @@ def process_item(url):
         'desc_snippet': desc_snippet
     }
 
+def get_all_ads(query, url, pages, log_func=print):
+    if url:
+        log_func(f"Henter alle URLs for linket '{url}' op til {pages} sider...")
+    else:
+        log_func(f"Henter alle URLs for '{query}' op til {pages} sider...")
+        
+    all_urls = []
+    for p in range(1, pages + 1):
+        urls = get_item_urls(p, query=query, base_url=url)
+        if not urls:
+            log_func(f"Side {p}: Ingen annoncer fundet. Stopper søgningen efter flere sider.")
+            break
+        log_func(f"Side {p}: Fandt {len(urls)} annoncer.")
+        all_urls.extend(urls)
+
+    all_urls = list(set(all_urls))
+    results = []
+    
+    if not all_urls:
+        log_func("Søgningen resulterede ikke i nogen annoncer.")
+        return []
+
+    log_func(f"I alt {len(all_urls)} unikke annoncer skal hentes.")
+    log_func("Begynder at hente annoncerne (dette kan tage et øjeblik)...")
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_url = {executor.submit(process_item, u): u for u in all_urls}
+        for i, future in enumerate(as_completed(future_to_url)):
+            res = future.result()
+            if res:
+                results.append(res)
+            if (i+1) % 20 == 0 or (i+1) == len(all_urls):
+                log_func(f"Hentet {i+1}/{len(all_urls)} annoncer")
+
+    results.sort(key=lambda x: x['name'])
+    return results
+
+def write_markdown(results, output_file, title, pages):
+    with open(output_file, 'w', encoding='utf-8') as out:
+        out.write(f"# DBA Oversigt for: {title}\n\n")
+        out.write(f"*Dato for udtræk: Der blev analyseret {len(results)} annoncer på tværs af maksimalt {pages} sider.*\n\n")
+        out.write("| Navn | Beskrivelse | Kategori | Lokation | Pris | Stand | Årgang | Oprettet | Billede | URL |\n")
+        out.write("|---|---|---|---|---|---|---|---|---|---|\n")
+        for r in results:
+            img_link = f"[Billede]({r['image']})" if r['image'] != 'Intet billede' else "Intet"
+            out.write(f"| {r['name']} | {r['desc_snippet']} | {r['category_path']} | {r['location']} | {r['price']} | {r['condition']} | {r['age']} | {r['edited_date']} | {img_link} | [Link]({r['url']}) |\n")
+
 def main():
     parser = argparse.ArgumentParser(description="Skrab DBA for et bestemt produkt eller via en URL.")
     parser.add_argument('--query', type=str, help='Søgestrengen på DBA (bruges hvis --url ikke er angivet)')
@@ -174,52 +228,12 @@ def main():
     if not args.query and not args.url:
         args.query = 'fender stratocaster'
 
-    if args.url:
-        print(f"Henter alle URLs for linket '{args.url}' op til {args.pages} sider...")
-    else:
-        print(f"Henter alle URLs for '{args.query}' op til {args.pages} sider...")
-        
-    all_urls = []
-    for p in range(1, args.pages + 1):
-        urls = get_item_urls(p, query=args.query, base_url=args.url)
-        if not urls:
-            print(f"Side {p}: Ingen annoncer fundet. Stopper søgningen efter flere sider.")
-            break
-        print(f"Side {p}: Fandt {len(urls)} annoncer.")
-        all_urls.extend(urls)
-
-    all_urls = list(set(all_urls))
-    results = []
+    results = get_all_ads(args.query, args.url, args.pages, print)
     
-    if not all_urls:
-        print("Søgningen resulterede ikke i nogen annoncer.")
-        return
-
-    print(f"I alt {len(all_urls)} unikke annoncer skal hentes.")
-    print("Begynder at hente annoncerne (dette kan tage et øjeblik)...")
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_url = {executor.submit(process_item, url): url for url in all_urls}
-        for i, future in enumerate(as_completed(future_to_url)):
-            res = future.result()
-            if res:
-                results.append(res)
-            if (i+1) % 20 == 0 or (i+1) == len(all_urls):
-                print(f"Hentet {i+1}/{len(all_urls)} annoncer")
-
-    results.sort(key=lambda x: x['name'])
-    
-    title = args.url if args.url else args.query.title()
-    
-    with open(args.output, 'w', encoding='utf-8') as out:
-        out.write(f"# DBA Oversigt for: {title}\n\n")
-        out.write(f"*Dato for udtræk: Der blev analyseret {len(results)} annoncer på tværs af maksimalt {args.pages} sider.*\n\n")
-        out.write("| Navn | Beskrivelse | Kategori | Lokation | Pris | Stand | Årgang | Oprettet | Billede | URL |\n")
-        out.write("|---|---|---|---|---|---|---|---|---|---|\n")
-        for r in results:
-            img_link = f"[Billede]({r['image']})" if r['image'] != 'Intet billede' else "Intet"
-            out.write(f"| {r['name']} | {r['desc_snippet']} | {r['category_path']} | {r['location']} | {r['price']} | {r['condition']} | {r['age']} | {r['edited_date']} | {img_link} | [Link]({r['url']}) |\n")
-
-    print(f"Færdig! Resultater gemt i {args.output}")
+    if results:
+        title = args.url if args.url else args.query.title()
+        write_markdown(results, args.output, title, args.pages)
+        print(f"Færdig! Resultater gemt i {args.output}")
 
 if __name__ == '__main__':
     main()

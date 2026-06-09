@@ -12,15 +12,39 @@ import re
 import bs4
 import argparse
 import urllib.parse
+import time
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+try:
+    import requests_cache
+    # Gemmer cachet i en sqlite fil 'dba_cache' og beholder det i 1 time (3600 sekunder)
+    requests_cache.install_cache('dba_cache', expire_after=3600)
+    CACHE_ENABLED = True
+except ImportError:
+    CACHE_ENABLED = False
 
 session = requests.Session()
 session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+
+# Konfigurer Retries (prøv op til 3 gange ved netværksfejl, f.eks. ved 'Too Many Requests' 429)
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[ 429, 500, 502, 503, 504 ])
+adapter = HTTPAdapter(max_retries=retries)
+session.mount('http://', adapter)
+session.mount('https://', adapter)
 
 def fetch_page(url):
     try:
         response = session.get(url, timeout=10)
         response.encoding = 'utf-8'
+        
+        # Rate limiting: Hvis svaret er hentet direkte fra nettet (og ikke via cache), tager vi en lille pause
+        if not getattr(response, 'from_cache', False):
+            time.sleep(random.uniform(0.5, 1.5))
+            
         return response.text
     except Exception as e:
         print(f"Error fetching {url}: {e}")
@@ -91,6 +115,7 @@ def process_item(url):
     location = "Ukendt"
     primary_image = "Intet billede"
     category_path = "Ukendt"
+    extras_dict = {}
 
     match_hyd = re.search(r'window\.__staticRouterHydrationData = JSON\.parse\("(.*?)"\);', html)
     if match_hyd:
@@ -117,6 +142,15 @@ def process_item(url):
                 uri = safe_get(images[0], ['uri'])
                 if uri:
                     primary_image = uri
+                    
+            # Extras (betegnelser/specifikationer)
+            item_extras = safe_get(item_data, ['extras'])
+            if isinstance(item_extras, list):
+                for ext in item_extras:
+                    label = ext.get('label')
+                    val = ext.get('value')
+                    if label and val:
+                        extras_dict[label] = val
                     
             # Category
             json_ld = safe_get(item_recom, ['jsonLd'])
@@ -158,9 +192,22 @@ def process_item(url):
     
     desc_snippet = (re.sub(r'\s+', ' ', desc)[:150].strip() + '...') if desc else 'Ingen beskrivelse fundet'
     
+    numeric_price = None
+    try:
+        if isinstance(price, (int, float)):
+            numeric_price = int(price)
+        elif isinstance(price, str) and price != "Ukendt":
+            clean_price = price.replace('.', '').replace(',', '')
+            if clean_price.isdigit():
+                numeric_price = int(clean_price)
+    except:
+        pass
+        
+    final_price = numeric_price if numeric_price is not None else price
+    
     return {
         'name': name.replace('\n', ' ').strip(),
-        'price': f"{price} DKK" if price != "Ukendt" else price,
+        'price': final_price,
         'condition': condition,
         'age': age,
         'edited_date': edited_date,
@@ -168,10 +215,11 @@ def process_item(url):
         'category_path': category_path,
         'image': primary_image,
         'url': url,
-        'desc_snippet': desc_snippet
+        'desc_snippet': desc_snippet,
+        'extras': extras_dict
     }
 
-def get_all_ads(query, url, pages, log_func=print):
+def get_all_ads(query, url, pages, log_func=print, stop_event=None):
     if url:
         log_func(f"Henter alle URLs for linket '{url}' op til {pages} sider...")
     else:
@@ -179,12 +227,20 @@ def get_all_ads(query, url, pages, log_func=print):
         
     all_urls = []
     for p in range(1, pages + 1):
+        if stop_event and stop_event.is_set():
+            log_func("Søgning afbrudt af brugeren (ved sidetal).")
+            break
+            
         urls = get_item_urls(p, query=query, base_url=url)
         if not urls:
             log_func(f"Side {p}: Ingen annoncer fundet. Stopper søgningen efter flere sider.")
             break
         log_func(f"Side {p}: Fandt {len(urls)} annoncer.")
         all_urls.extend(urls)
+
+    if stop_event and stop_event.is_set():
+        log_func("Afbrudt før annonce-hentning begyndte.")
+        return []
 
     all_urls = list(set(all_urls))
     results = []
@@ -195,9 +251,17 @@ def get_all_ads(query, url, pages, log_func=print):
 
     log_func(f"I alt {len(all_urls)} unikke annoncer skal hentes.")
     log_func("Begynder at hente annoncerne (dette kan tage et øjeblik)...")
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    
+    # Skruet ned til max_workers=3 for at være mere skånsom over for DBAs servere
+    with ThreadPoolExecutor(max_workers=3) as executor:
         future_to_url = {executor.submit(process_item, u): u for u in all_urls}
         for i, future in enumerate(as_completed(future_to_url)):
+            if stop_event and stop_event.is_set():
+                log_func("Hentning af annoncer afbrudt af brugeren. Annullerer resterende forespørgsler...")
+                for f in future_to_url:
+                    f.cancel()
+                break
+                
             res = future.result()
             if res:
                 results.append(res)
@@ -208,14 +272,104 @@ def get_all_ads(query, url, pages, log_func=print):
     return results
 
 def write_markdown(results, output_file, title, pages):
+    categories = sorted(list(set(r['category_path'] for r in results)))
+
     with open(output_file, 'w', encoding='utf-8') as out:
         out.write(f"# DBA Oversigt for: {title}\n\n")
         out.write(f"*Dato for udtræk: Der blev analyseret {len(results)} annoncer på tværs af maksimalt {pages} sider.*\n\n")
-        out.write("| Navn | Beskrivelse | Kategori | Lokation | Pris | Stand | Årgang | Oprettet | Billede | URL |\n")
-        out.write("|---|---|---|---|---|---|---|---|---|---|\n")
-        for r in results:
-            img_link = f"[Billede]({r['image']})" if r['image'] != 'Intet billede' else "Intet"
-            out.write(f"| {r['name']} | {r['desc_snippet']} | {r['category_path']} | {r['location']} | {r['price']} | {r['condition']} | {r['age']} | {r['edited_date']} | {img_link} | [Link]({r['url']}) |\n")
+        
+        for idx, cat in enumerate(categories):
+            cat_results = [r for r in results if r['category_path'] == cat]
+            
+            extra_keys = set()
+            for r in cat_results:
+                extra_keys.update(r.get('extras', {}).keys())
+                
+            extra_keys = sorted(list(extra_keys))
+            if 'Stand' in extra_keys:
+                extra_keys.remove('Stand')
+                
+            out.write(f"## Kategori: {cat}\n\n")
+            
+            headers = ["Navn", "Beskrivelse", "Lokation", "Pris", "Stand", "Årgang"] + extra_keys + ["Oprettet", "Billede", "URL"]
+            out.write("| " + " | ".join(headers) + " |\n")
+            out.write("|" + "|".join(["---"] * len(headers)) + "|\n")
+            
+            for r in cat_results:
+                img_link = f"[Billede]({r['image']})" if r['image'] != 'Intet billede' else "Intet"
+                price_str = f"{r['price']} DKK" if isinstance(r['price'], int) else str(r['price'])
+                
+                row = [
+                    r['name'], r['desc_snippet'], r['location'],
+                    price_str, r['condition'], r['age']
+                ]
+                for k in extra_keys:
+                    row.append(str(r.get('extras', {}).get(k, '')))
+                row.extend([r['edited_date'], img_link, f"[Link]({r['url']})"])
+                
+                out.write("| " + " | ".join(row) + " |\n")
+                
+            if idx < len(categories) - 1:
+                # 2 linjers afstand (Markdown kræver enten <br> eller blot flere blanke linjer. Vi bruger 3 blanke linjer)
+                out.write("\n\n\n")
+
+def write_excel(results, output_file, title, pages):
+    import pandas as pd
+    categories = sorted(list(set(r['category_path'] for r in results)))
+    
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        start_row = 0
+        for idx, cat in enumerate(categories):
+            cat_results = [r for r in results if r['category_path'] == cat]
+            
+            extra_keys = set()
+            for r in cat_results:
+                extra_keys.update(r.get('extras', {}).keys())
+                
+            extra_keys = sorted(list(extra_keys))
+            if 'Stand' in extra_keys:
+                extra_keys.remove('Stand')
+                
+            flattened = []
+            for r in cat_results:
+                flat_r = r.copy()
+                for k in extra_keys:
+                    flat_r[k] = flat_r.get('extras', {}).get(k, '')
+                if 'extras' in flat_r:
+                    del flat_r['extras']
+                flattened.append(flat_r)
+                
+            df = pd.DataFrame(flattened)
+            
+            base_cols = ['name', 'desc_snippet', 'location', 'price', 'condition', 'age']
+            end_cols = ['edited_date', 'image', 'url']
+            
+            final_cols = []
+            for c in base_cols:
+                if c in df.columns: final_cols.append(c)
+            for c in extra_keys:
+                if c in df.columns: final_cols.append(c)
+            for c in end_cols:
+                if c in df.columns: final_cols.append(c)
+                
+            df = df[final_cols]
+            
+            df.rename(columns={
+                'name': 'Navn', 'price': 'Pris (DKK)', 'condition': 'Stand', 
+                'age': 'Årgang', 'edited_date': 'Dato', 'location': 'Lokation', 
+                'image': 'Billede', 'url': 'Link', 'desc_snippet': 'Beskrivelse'
+            }, inplace=True)
+            
+            # Skriv kategoriens navn før selve tabellen
+            title_df = pd.DataFrame([[f"Kategori: {cat}"]])
+            title_df.to_excel(writer, startrow=start_row, index=False, header=False)
+            start_row += 1
+            
+            # Skriv DataFrame
+            df.to_excel(writer, startrow=start_row, index=False)
+            
+            # start_row opdateres. len(df) er antal datarækker, +1 for kolonneoverskrifter, +2 for at få 2 tomme rækker bagefter
+            start_row += len(df) + 1 + 2
 
 def main():
     parser = argparse.ArgumentParser(description="Skrab DBA for et bestemt produkt eller via en URL.")

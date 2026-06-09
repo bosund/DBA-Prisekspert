@@ -7,7 +7,7 @@ Forfatteren tager intet ansvar for misbrug eller blokeringer forårsaget af dett
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 import subprocess
 import threading
 import sys
@@ -40,14 +40,17 @@ class DBAScraperGUI:
         self.pages_var = tk.IntVar(value=5)
         ttk.Spinbox(input_frame, from_=1, to=1000, textvariable=self.pages_var, width=10).grid(row=2, column=1, sticky=tk.W, pady=2)
 
-        # Output fil
-        ttk.Label(input_frame, text="Output filnavn:").grid(row=3, column=0, sticky=tk.W, pady=2)
-        self.output_var = tk.StringVar(value="dba_oversigt.md")
-        ttk.Entry(input_frame, textvariable=self.output_var, width=30).grid(row=3, column=1, sticky=tk.W, pady=2)
+        # Action Buttons Frame
+        btn_frame = ttk.Frame(root)
+        btn_frame.pack(pady=5)
 
-        # Start Button
-        self.start_btn = ttk.Button(root, text="Start Scraping", command=self.start_scraping)
-        self.start_btn.pack(pady=5)
+        self.start_btn = ttk.Button(btn_frame, text="Start Scraping", command=self.start_scraping)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_btn = ttk.Button(btn_frame, text="Stop / Annuller", command=self.stop_scraping, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_event = threading.Event()
 
         # Output Text
         ttk.Label(root, text="Log:").pack(anchor=tk.W, padx=10)
@@ -60,47 +63,57 @@ class DBAScraperGUI:
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
 
+    def stop_scraping(self):
+        self.stop_event.set()
+        self.stop_btn.config(state=tk.DISABLED)
+        self.log("\n--- Annullerer scraping... Venter på baggrundsopgaver ---")
+
     def start_scraping(self):
         query = self.query_var.get().strip()
         url = self.url_var.get().strip()
         pages = self.pages_var.get()
-        output = self.output_var.get().strip()
 
         if not query and not url:
             messagebox.showwarning("Fejl", "Du skal angive enten en søgestreng eller en URL.")
             return
 
+        self.stop_event.clear()
         self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
         self.log_text.config(state=tk.NORMAL)
         self.log_text.delete(1.0, tk.END)
         self.log_text.config(state=tk.DISABLED)
         
         # Run in a background thread to prevent GUI freezing
-        thread = threading.Thread(target=self.run_script, args=(query, url, pages, output))
+        thread = threading.Thread(target=self.run_script, args=(query, url, pages))
         thread.daemon = True
         thread.start()
 
-    def run_script(self, query, url, pages, output):
+    def run_script(self, query, url, pages):
         def gui_logger(msg):
             self.root.after(0, self.log, msg)
 
         try:
-            results = scrape_all.get_all_ads(query, url, pages, log_func=gui_logger)
+            results = scrape_all.get_all_ads(query, url, pages, log_func=gui_logger, stop_event=self.stop_event)
             if not results:
                 self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
+                self.root.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
                 return
 
             categories = list(set(r['category_path'] for r in results))
             categories.sort()
 
             # Trigger the filter popup on the main thread
-            self.root.after(0, self.show_category_filter, results, categories, output, query, url, pages)
+            self.root.after(0, self.show_category_filter, results, categories, query, url, pages)
             
         except Exception as e:
             gui_logger(f"\n--- EXCEPTION: {str(e)} ---")
             self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
 
-    def show_category_filter(self, results, categories, output, query, url, pages):
+    def show_category_filter(self, results, categories, query, url, pages):
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
         popup = tk.Toplevel(self.root)
         popup.title("Vælg Kategorier")
         popup.geometry("500x400")
@@ -134,30 +147,73 @@ class DBAScraperGUI:
             cb = ttk.Checkbutton(scrollable_frame, text=cat, variable=var)
             cb.pack(anchor=tk.W, pady=2)
 
-        def on_ok():
+        def save_file(format_type):
             selected_cats = {cat for cat, var in checkbox_vars.items() if var.get()}
             filtered_results = [r for r in results if r['category_path'] in selected_cats]
             
             title = url if url else query.title()
             
-            output_path = output
-            if not os.path.isabs(output_path):
-                if getattr(sys, 'frozen', False):
-                    application_path = os.path.dirname(sys.executable)
-                else:
-                    application_path = os.path.dirname(os.path.abspath(__file__))
-                output_path = os.path.join(application_path, output_path)
+            if format_type == 'excel':
+                file_types = [("Excel filer", "*.xlsx"), ("Alle filer", "*.*")]
+                default_ext = ".xlsx"
+            else:
+                file_types = [("Markdown filer", "*.md"), ("Alle filer", "*.*")]
+                default_ext = ".md"
+                
+            output_path = filedialog.asksaveasfilename(
+                parent=popup,
+                title="Gem annonceoversigt",
+                defaultextension=default_ext,
+                filetypes=file_types
+            )
+            
+            if not output_path:
+                return # Brugeren afbrød gem
 
             try:
-                scrape_all.write_markdown(filtered_results, output_path, title, pages)
-                self.log(f"\n--- SUCCES: Scraping færdig. Gemt {len(filtered_results)} annoncer i {output} ---")
+                if format_type == 'excel':
+                    scrape_all.write_excel(filtered_results, output_path, title, pages)
+                else:
+                    scrape_all.write_markdown(filtered_results, output_path, title, pages)
+                self.log(f"\n--- SUCCES: Scraping færdig. Gemt {len(filtered_results)} annoncer i {os.path.basename(output_path)} ---")
+                popup.destroy()
+                
+                # Vis succes-besked
+                success_dlg = tk.Toplevel(self.root)
+                success_dlg.title("Fil gemt")
+                success_dlg.geometry("450x150")
+                success_dlg.transient(self.root)
+                success_dlg.grab_set()
+                
+                ttk.Label(success_dlg, text="Filen blev gemt med succes!", font=("TkDefaultFont", 10, "bold")).pack(pady=(15, 5))
+                
+                # Gør stien pæn for visning
+                display_path = os.path.normpath(output_path)
+                ttk.Label(success_dlg, text=f"Sti: {display_path}", wraplength=430).pack(pady=5, padx=10)
+                
+                btn_frame2 = ttk.Frame(success_dlg)
+                btn_frame2.pack(pady=10)
+                
+                def open_file_and_close():
+                    try:
+                        os.startfile(output_path)
+                    except Exception as ex:
+                        messagebox.showerror("Fejl", f"Kunne ikke åbne filen: {str(ex)}")
+                    success_dlg.destroy()
+                
+                ttk.Button(btn_frame2, text="Åbn fil", command=open_file_and_close).pack(side=tk.LEFT, padx=5)
+                ttk.Button(btn_frame2, text="OK", command=success_dlg.destroy).pack(side=tk.LEFT, padx=5)
+
             except Exception as e:
                 self.log(f"\n--- FEJL under gem: {str(e)} ---")
-                
-            self.start_btn.config(state=tk.NORMAL)
-            popup.destroy()
+                messagebox.showerror("Fejl under gem", f"Der opstod en fejl under forsøget på at gemme filen:\n\n{str(e)}")
 
-        ttk.Button(popup, text="OK", command=on_ok).pack(pady=10)
+        btn_frame = ttk.Frame(popup)
+        btn_frame.pack(pady=10)
+        
+        ttk.Button(btn_frame, text="Gem som Excel", command=lambda: save_file('excel')).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Gem som Markdown", command=lambda: save_file('md')).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Luk uden at gemme", command=popup.destroy).pack(side=tk.LEFT, padx=5)
 
 if __name__ == "__main__":
     root = tk.Tk()
